@@ -487,7 +487,6 @@ if (''.equals(releaseGpgFingerprint)) {
                 '--no-cache', // force fresh downloads from our current network
                 "--iidfile", imageIdFileOfficial(variant),
                 '--build-arg', "SOLR_DOWNLOAD_SERVER=http://${downloadHost}:9876",
-                '--tag', officialDockerImageName(variant),
                 '-'
           }
 
