@@ -30,6 +30,8 @@ import static org.apache.solr.metrics.SolrMetricManager.NODE_REGISTRY;
 import static org.apache.solr.metrics.SolrMetricProducer.CATEGORY_ATTR;
 import static org.apache.solr.metrics.SolrMetricProducer.HANDLER_ATTR;
 import static org.apache.solr.metrics.SolrMetricProducer.NAME_ATTR;
+import static org.apache.solr.metrics.SolrMetricProducer.OPERATION_ATTR;
+import static org.apache.solr.metrics.SolrMetricProducer.RESULT_ATTR;
 import static org.apache.solr.metrics.SolrMetricProducer.TYPE_ATTR;
 import static org.apache.solr.search.SolrIndexSearcher.EXECUTOR_MAX_CPU_THREADS;
 import static org.apache.solr.security.AuthenticationPlugin.AUTHENTICATION_PLUGIN_PROP;
@@ -37,6 +39,7 @@ import static org.apache.solr.security.AuthenticationPlugin.AUTHENTICATION_PLUGI
 import com.github.benmanes.caffeine.cache.Interner;
 import com.google.common.annotations.VisibleForTesting;
 import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.metrics.ObservableLongMeasurement;
 import io.opentelemetry.api.trace.Tracer;
 import jakarta.inject.Singleton;
 import java.io.IOException;
@@ -63,6 +66,7 @@ import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import org.apache.lucene.index.CorruptIndexException;
 import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.LRUQueryCache;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.util.BytesRef;
 import org.apache.solr.api.ClusterPluginsSource;
@@ -287,6 +291,8 @@ public class CoreContainer {
   private volatile SolrClientCache solrClientCache;
 
   private volatile Map<String, SolrCache<?, ?>> caches;
+
+  private volatile LRUQueryCache nodeQueryCache;
 
   private final ObjectCache objectCache = new ObjectCache();
 
@@ -702,6 +708,61 @@ public class CoreContainer {
   }
 
   /**
+   * The node-level Lucene query cache shared by all cores, or null if disabled. Sized via {@code
+   * queryCacheMaxRam} in solr.xml. Entries are per-segment, so they survive searcher reopens for
+   * unchanged segments and are purged automatically when segment readers close.
+   */
+  public LRUQueryCache getNodeQueryCache() {
+    return nodeQueryCache;
+  }
+
+  private void initializeNodeQueryCacheMetrics(LRUQueryCache cache) {
+    Attributes cacheAttributes =
+        Attributes.builder()
+            .put(CATEGORY_ATTR, SolrInfoBean.Category.CACHE.toString())
+            .put(NAME_ATTR, "queryCache")
+            .build();
+
+    ObservableLongMeasurement lookupsMetric =
+        solrMetricsContext.longCounterMeasurement(
+            "solr.node.query_cache.lookups",
+            "Number of cumulative cache lookup results (hits and misses)");
+
+    ObservableLongMeasurement operationsMetric =
+        solrMetricsContext.longCounterMeasurement(
+            "solr.node.query_cache.ops",
+            "Number of cumulative cache operations (inserts and evictions)");
+
+    ObservableLongMeasurement sizeMetric =
+        solrMetricsContext.longGaugeMeasurement(
+            "solr.node.query_cache.size", "Current number of cached (query, segment) entries");
+
+    ObservableLongMeasurement ramBytesUsedMetric =
+        solrMetricsContext.longGaugeMeasurement(
+            "solr.node.query_cache.ram_used", "RAM bytes used by cache", OtelUnit.BYTES);
+
+    solrMetricsContext.batchCallback(
+        () -> {
+          lookupsMetric.record(
+              cache.getHitCount(), cacheAttributes.toBuilder().put(RESULT_ATTR, "hit").build());
+          lookupsMetric.record(
+              cache.getMissCount(), cacheAttributes.toBuilder().put(RESULT_ATTR, "miss").build());
+          operationsMetric.record(
+              cache.getCacheCount(),
+              cacheAttributes.toBuilder().put(OPERATION_ATTR, "inserts").build());
+          operationsMetric.record(
+              cache.getEvictionCount(),
+              cacheAttributes.toBuilder().put(OPERATION_ATTR, "evictions").build());
+          sizeMetric.record(cache.getCacheSize(), cacheAttributes);
+          ramBytesUsedMetric.record(cache.ramBytesUsed(), cacheAttributes);
+        },
+        lookupsMetric,
+        operationsMetric,
+        sizeMetric,
+        ramBytesUsedMetric);
+  }
+
+  /**
    * The {@link SolrClientCache} is mostly for streaming expressions. Prefer other clients for other
    * use-cases.
    *
@@ -819,6 +880,11 @@ public class CoreContainer {
         m.put(cacheName, c);
       }
       this.caches = Collections.unmodifiableMap(m);
+    }
+
+    if (cfg.getQueryCacheMaxRamBytes() > 0) {
+      nodeQueryCache = new LRUQueryCache(cfg.getQueryCacheCount(), cfg.getQueryCacheMaxRamBytes());
+      initializeNodeQueryCacheMetrics(nodeQueryCache);
     }
 
     StartupLoggingUtils.checkRequestLogging();
