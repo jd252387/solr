@@ -202,6 +202,9 @@ public abstract class QParser {
         // that preserves the cache/cost settings as the outermost layer.
         String name = localParams.get(QueryParsing.NAME);
         if (name != null && !name.isBlank() && query != null) {
+          // record the pre-wrap query with its raw query string for downstream consumers
+          // (e.g. hl.matchedQueries); the raw string is unrecoverable after parsing
+          QueryParsing.registerNamedQuery(req, name, qstr, query);
           query = NamedMatches.wrapQuery(name, query);
         }
 

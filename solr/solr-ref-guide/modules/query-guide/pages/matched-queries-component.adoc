@@ -119,3 +119,7 @@ Register the component in the request handler in `solrconfig.xml`:
 ----
 
 The component name `matched_queries` is pre-registered by Solr and does not require an explicit `<searchComponent>` declaration.
+
+== Highlighting Integration
+
+The xref:highlighting.adoc#hl-matchedqueries[`hl.matchedQueries`] parameter of the unified highlighter relates each highlight to the named queries whose terms produced it, embedding the query name, the original (pre-analysis) query string, and the post-analysis term or phrase in the highlight's pre-tag.

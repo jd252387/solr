@@ -99,4 +99,5 @@ public interface HighlightParams {
   public static final String CACHE_FIELD_VAL_CHARS_THRESHOLD =
       HIGHLIGHT + ".cacheFieldValCharsThreshold"; // UH
   public static final String WEIGHT_MATCHES = HIGHLIGHT + ".weightMatches"; // UH
+  public static final String MATCHED_QUERIES = HIGHLIGHT + ".matchedQueries"; // UH
 }

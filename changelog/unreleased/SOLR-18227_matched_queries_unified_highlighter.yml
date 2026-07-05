@@ -1,0 +1,7 @@
+title: "Add `hl.matchedQueries` to the Unified Highlighter: highlight pre-tags gain a `data-matched-queries` attribute relating each highlight to the `name=` queries (name, original query string, post-analysis term/phrase) whose terms produced it."
+type: added
+authors:
+  - name: John Doe
+links:
+  - name: SOLR-18227
+    url: https://issues.apache.org/jira/browse/SOLR-18227

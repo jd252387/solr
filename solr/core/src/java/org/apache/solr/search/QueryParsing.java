@@ -18,7 +18,9 @@ package org.apache.solr.search;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.search.BooleanClause;
 import org.apache.lucene.search.BooleanQuery;
@@ -36,6 +38,7 @@ import org.apache.solr.common.params.ModifiableSolrParams;
 import org.apache.solr.common.params.SolrParams;
 import org.apache.solr.legacy.LegacyNumericRangeQuery;
 import org.apache.solr.parser.QueryParser;
+import org.apache.solr.request.SolrQueryRequest;
 import org.apache.solr.schema.FieldType;
 import org.apache.solr.schema.IndexSchema;
 
@@ -54,6 +57,33 @@ public class QueryParsing {
   // true if the value was specified by the "v" param (i.e. v=myval, or v=$param)
   public static final String VAL_EXPLICIT = "__VAL_EXPLICIT__";
   public static final String NAME = "name";
+  // request-context key under which named (name= local param) queries are recorded at parse time
+  public static final String NAMED_QUERIES_CONTEXT_KEY = "solr.namedQueries";
+
+  /**
+   * A query parsed from a {@code name=} local param, recorded at parse time so downstream consumers
+   * (e.g. highlighting) can relate the name to the raw pre-analysis query string and the parsed
+   * (post-analysis) query.
+   */
+  public record NamedQueryInfo(String originalQuery, Query query) {}
+
+  /** Records a {@code name=} query in the request context; last registration of a name wins. */
+  public static void registerNamedQuery(
+      SolrQueryRequest req, String name, String qstr, Query query) {
+    @SuppressWarnings("unchecked")
+    Map<String, NamedQueryInfo> named =
+        (Map<String, NamedQueryInfo>)
+            req.getContext().computeIfAbsent(NAMED_QUERIES_CONTEXT_KEY, k -> new LinkedHashMap<>());
+    named.put(name, new NamedQueryInfo(qstr, query));
+  }
+
+  /** Named queries recorded by {@link #registerNamedQuery}, in registration order. */
+  public static Map<String, NamedQueryInfo> getNamedQueries(SolrQueryRequest req) {
+    @SuppressWarnings("unchecked")
+    Map<String, NamedQueryInfo> named =
+        (Map<String, NamedQueryInfo>) req.getContext().get(NAMED_QUERIES_CONTEXT_KEY);
+    return named == null ? Map.of() : named;
+  }
 
   /**
    * @param txt Text to parse

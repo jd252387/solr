@@ -509,6 +509,25 @@ Furthermore, phrases will be highlighted as a whole instead of word by word.  Cu
 +
 If either `hl.usePhraseHighlighter` or `hl.multiTermQuery` are set to `false`, then this setting is effectively `false` no matter what you set it to.
 
+[[hl-matchedqueries]]
+`hl.matchedQueries`::
++
+[%autowidth,frame=none]
+|===
+|Optional |Default: `false`
+|===
++
+Relates each highlight to the named queries (`name=` local parameter, see xref:matched-queries-component.adoc[]) whose terms produced it.
+The pre-tag (`hl.tag.pre`) of a highlight gains a `data-matched-queries` attribute whose value is a JSON array of objects with `name` (the query name), `original` (the named query's raw, pre-analysis query string), and `analyzed` (the post-analysis term or phrase that matched), e.g.:
++
+[source,html]
+----
+<em data-matched-queries='[{"name":"id_1","original":"Walking in The Park","analyzed":"walk in park"}]'>Walked in The Park</em>
+----
++
+Attribution is term-based, not positional: a highlight lists every named query containing that post-analysis term or phrase for the field, even if only one of them matched at that position.
+Highlights from wildcard, fuzzy, and other multi-term queries are not attributed.
+
 == Original Highlighter
 
 The Original Highlighter supports these following additional parameters to the ones listed earlier:

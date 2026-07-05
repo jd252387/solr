@@ -18,8 +18,11 @@ package org.apache.solr.highlight;
 
 import java.io.IOException;
 import java.text.BreakIterator;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.EnumSet;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -27,27 +30,33 @@ import java.util.Set;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.Term;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.Query;
+import org.apache.lucene.search.QueryVisitor;
 import org.apache.lucene.search.uhighlight.CustomSeparatorBreakIterator;
 import org.apache.lucene.search.uhighlight.DefaultPassageFormatter;
 import org.apache.lucene.search.uhighlight.LengthGoalBreakIterator;
+import org.apache.lucene.search.uhighlight.Passage;
 import org.apache.lucene.search.uhighlight.PassageFormatter;
 import org.apache.lucene.search.uhighlight.PassageScorer;
 import org.apache.lucene.search.uhighlight.UnifiedHighlighter;
 import org.apache.lucene.search.uhighlight.WholeBreakIterator;
+import org.apache.lucene.util.BytesRef;
 import org.apache.solr.common.SolrDocument;
 import org.apache.solr.common.SolrException;
 import org.apache.solr.common.params.HighlightParams;
 import org.apache.solr.common.params.SolrParams;
 import org.apache.solr.common.util.NamedList;
 import org.apache.solr.common.util.SimpleOrderedMap;
+import org.apache.solr.common.util.Utils;
 import org.apache.solr.core.PluginInfo;
 import org.apache.solr.request.SolrQueryRequest;
 import org.apache.solr.schema.IndexSchema;
 import org.apache.solr.schema.SchemaField;
 import org.apache.solr.search.DocIterator;
 import org.apache.solr.search.DocList;
+import org.apache.solr.search.QueryParsing;
 import org.apache.solr.search.SolrDocumentFetcher;
 import org.apache.solr.search.SolrIndexSearcher;
 import org.apache.solr.search.SolrReturnFields;
@@ -126,6 +135,9 @@ import org.apache.solr.util.plugin.PluginInfoInitialized;
  *   <li>hl.offsetSource (string) specifies which offset source to use, prefers postings, but will
  *       use what's available if not specified
  *   <li>hl.weightMatches (bool) enables Lucene Weight Matches mode
+ *   <li>hl.matchedQueries (bool) augments the pre-tag of each highlighted region with a
+ *       data-matched-queries attribute identifying the name= queries whose terms produced it.
+ *       default is false
  * </ul>
  *
  * @lucene.experimental
@@ -240,6 +252,7 @@ public class UnifiedSolrHighlighter extends SolrHighlighter implements PluginInf
   protected static class SolrExtendedUnifiedHighlighter extends UnifiedHighlighter {
     protected static final Predicate<String> NOT_REQUIRED_FIELD_MATCH_PREDICATE = s -> true;
     private final SolrIndexSearcher solrIndexSearcher;
+    protected final SolrQueryRequest req;
     protected final SolrParams params;
 
     protected final IndexSchema schema;
@@ -247,6 +260,7 @@ public class UnifiedSolrHighlighter extends SolrHighlighter implements PluginInf
 
     public SolrExtendedUnifiedHighlighter(SolrQueryRequest req) {
       super(req.getSearcher(), req.getSchema().getIndexAnalyzer());
+      this.req = req;
       this.solrIndexSearcher = req.getSearcher();
       this.params = req.getParams();
       this.schema = req.getSchema();
@@ -310,7 +324,65 @@ public class UnifiedSolrHighlighter extends SolrHighlighter implements PluginInf
       String ellipsis =
           params.getFieldParam(fieldName, HighlightParams.TAG_ELLIPSIS, SNIPPET_SEPARATOR);
       String encoder = params.getFieldParam(fieldName, HighlightParams.ENCODER, "simple");
-      return new DefaultPassageFormatter(preTag, postTag, ellipsis, "html".equals(encoder));
+      boolean escape = "html".equals(encoder);
+
+      if (params.getFieldBool(fieldName, HighlightParams.MATCHED_QUERIES, false)) {
+        Map<String, Map<String, String>> termToNamedQueries = buildTermToNamedQueries(fieldName);
+        if (!termToNamedQueries.isEmpty()) {
+          return new MatchedQueriesPassageFormatter(
+              preTag, postTag, ellipsis, escape, termToNamedQueries);
+        }
+      }
+      return new DefaultPassageFormatter(preTag, postTag, ellipsis, escape);
+    }
+
+    /**
+     * Maps each post-analysis term (and space-joined phrase, matching the match terms produced in
+     * {@link HighlightFlag#WEIGHT_MATCHES} mode) of every {@code name=} query recorded at parse
+     * time to {@code name -> original query string}, restricted to terms this field's {@link
+     * #getFieldMatcher(String)} accepts.
+     */
+    protected Map<String, Map<String, String>> buildTermToNamedQueries(String fieldName) {
+      Map<String, QueryParsing.NamedQueryInfo> namedQueries = QueryParsing.getNamedQueries(req);
+      if (namedQueries.isEmpty()) {
+        return Map.of();
+      }
+      Predicate<String> fieldMatcher = getFieldMatcher(fieldName);
+      Map<String, Map<String, String>> termToNamedQueries = new HashMap<>();
+      for (Map.Entry<String, QueryParsing.NamedQueryInfo> named : namedQueries.entrySet()) {
+        String name = named.getKey();
+        String original = named.getValue().originalQuery();
+        named
+            .getValue()
+            .query()
+            .visit(
+                new QueryVisitor() {
+                  @Override
+                  public boolean acceptField(String field) {
+                    return fieldMatcher.test(field);
+                  }
+
+                  @Override
+                  public void consumeTerms(Query query, Term... terms) {
+                    StringBuilder joined = new StringBuilder();
+                    for (Term term : terms) {
+                      termToNamedQueries
+                          .computeIfAbsent(term.text(), k -> new LinkedHashMap<>())
+                          .putIfAbsent(name, query.toString());
+                      if (joined.length() > 0) {
+                        joined.append(' ');
+                      }
+                      joined.append(term.text());
+                    }
+                    if (terms.length > 1) {
+                      termToNamedQueries
+                          .computeIfAbsent(joined.toString(), k -> new LinkedHashMap<>())
+                          .putIfAbsent(name, query.toString());
+                    }
+                  }
+                });
+      }
+      return termToNamedQueries;
     }
 
     @Override
@@ -457,6 +529,104 @@ public class UnifiedSolrHighlighter extends SolrHighlighter implements PluginInf
       }
 
       return NOT_REQUIRED_FIELD_MATCH_PREDICATE;
+    }
+  }
+
+  /**
+   * A {@link DefaultPassageFormatter} that augments the pre-tag of each highlighted region with a
+   * {@code data-matched-queries} attribute relating the highlight to the {@code name=} queries (see
+   * {@link QueryParsing#NAME}) whose post-analysis terms produced it. The attribute value is a JSON
+   * array of {@code {"name":..., "original":..., "analyzed":...}} objects where {@code original} is
+   * the named query's raw (pre-analysis) query string and {@code analyzed} is the post-analysis
+   * term/phrase that matched.
+   *
+   * <p>Attribution is term-based, not positional: a highlight lists every named query containing
+   * that post-analysis term/phrase for the field, even if only one of them matched at that
+   * position.
+   */
+  protected static class MatchedQueriesPassageFormatter extends DefaultPassageFormatter {
+    /** term/phrase text (post-analysis) -&gt; (query name -&gt; original query string) */
+    private final Map<String, Map<String, String>> termToNamedQueries;
+
+    public MatchedQueriesPassageFormatter(
+        String preTag,
+        String postTag,
+        String ellipsis,
+        boolean escape,
+        Map<String, Map<String, String>> termToNamedQueries) {
+      super(preTag, postTag, ellipsis, escape);
+      this.termToNamedQueries = termToNamedQueries;
+    }
+
+    // Same passage-stitching loop as DefaultPassageFormatter.format, except that the pre-tag of
+    // each highlighted region is augmented with the named queries of the region's match terms.
+    @Override
+    public String format(Passage[] passages, String content) {
+      StringBuilder sb = new StringBuilder();
+      int pos = 0;
+      for (Passage passage : passages) {
+        // don't add ellipsis if its the first one, or if its connected.
+        if (!sb.isEmpty() && passage.getStartOffset() != pos) {
+          sb.append(ellipsis);
+        }
+        pos = passage.getStartOffset();
+        for (int i = 0; i < passage.getNumMatches(); i++) {
+          int start = passage.getMatchStarts()[i];
+          assert start >= pos && start < passage.getEndOffset();
+          // append content before this start
+          append(sb, content, pos, start);
+
+          List<Map<String, String>> entries = new ArrayList<>();
+          addMatchedQueryEntries(entries, passage.getMatchTerms()[i]);
+          int end = passage.getMatchEnds()[i];
+          assert end > start;
+          // It's possible to have overlapping terms.
+          //   Look ahead to expand 'end' past all overlapping.
+          //   Only take new end if it is larger than current end.
+          while (i + 1 < passage.getNumMatches() && passage.getMatchStarts()[i + 1] < end) {
+            addMatchedQueryEntries(entries, passage.getMatchTerms()[i + 1]);
+            end = Math.max(end, passage.getMatchEnds()[++i]);
+          }
+          end = Math.min(end, passage.getEndOffset()); // in case match straddles past passage
+
+          sb.append(entries.isEmpty() ? preTag : augmentPreTag(entries));
+          append(sb, content, start, end);
+          sb.append(postTag);
+
+          pos = end;
+        }
+        // its possible a "term" from the analyzer could span a sentence boundary.
+        append(sb, content, pos, Math.max(pos, passage.getEndOffset()));
+        pos = passage.getEndOffset();
+      }
+      return sb.toString();
+    }
+
+    private void addMatchedQueryEntries(List<Map<String, String>> entries, BytesRef matchTerm) {
+      String analyzed = matchTerm.utf8ToString();
+      Map<String, String> named = termToNamedQueries.get(analyzed);
+      if (named == null) {
+        return;
+      }
+      for (Map.Entry<String, String> e : named.entrySet()) {
+        // dedupe by name across merged overlapping matches
+        if (entries.stream().anyMatch(entry -> e.getKey().equals(entry.get("name")))) {
+          continue;
+        }
+        Map<String, String> entry = new LinkedHashMap<>();
+        entry.put("name", e.getKey());
+        entry.put("original", e.getValue());
+        entry.put("analyzed", analyzed);
+        entries.add(entry);
+      }
+    }
+
+    private String augmentPreTag(List<Map<String, String>> entries) {
+      String json = Utils.toJSONString(entries, -1).replace("&", "&amp;").replace("'", "&#x27;");
+      String attr = " data-matched-queries='" + json + "'";
+      // inject as an attribute if the pre-tag looks like a tag, else append after it
+      int insertAt = preTag.endsWith(">") ? preTag.length() - 1 : preTag.length();
+      return new StringBuilder(preTag).insert(insertAt, attr).toString();
     }
   }
 }
